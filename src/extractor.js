@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, existsSync, readdirSync, renameSync, writeFileSync } from 'fs';
+import { mkdirSync, rmSync, existsSync, readdirSync, cpSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { Buffer } from 'buffer';
 import { extract } from 'tar';
@@ -33,10 +33,10 @@ export async function extractFrontend(base64Data, targetDir) {
     }
     mkdirSync(targetDir, { recursive: true });
 
-    // Move contents from frontendRoot to targetDir
+    // Copy contents from frontendRoot to targetDir (cpSync works cross-device)
     const items = readdirSync(frontendRoot);
     for (const item of items) {
-      renameSync(join(frontendRoot, item), join(targetDir, item));
+      cpSync(join(frontendRoot, item), join(targetDir, item), { recursive: true });
     }
 
     return true;
