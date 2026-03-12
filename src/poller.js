@@ -34,12 +34,13 @@ function flattenTransactions(response) {
 
   for (const item of response) {
     if (item && Array.isArray(item.Transactions)) {
+      const height = item.Height ?? 0;
       for (const tx of item.Transactions) {
-        transactions.push(tx);
+        transactions.push({ ...tx, _height: height });
       }
     } else if (item) {
       // Flat transaction / projected object
-      transactions.push(item);
+      transactions.push({ ...item, _height: item.Height ?? 0 });
     }
   }
   return transactions;
@@ -117,12 +118,15 @@ export async function poll() {
   const allTxs = await fetchMetadata();
   console.log(`[poll] Found ${allTxs.length} total APP_BE transaction(s)`);
 
-  // Group by sender, keep latest per sender (last wins = newest)
+  // Keep the newest tx per sender (highest block height wins)
   const latestBySender = new Map();
   for (const tx of allTxs) {
     const sender = tx.senderAddr || tx.sender_addr;
     if (!sender) continue;
-    latestBySender.set(sender, tx);
+    const prev = latestBySender.get(sender);
+    if (!prev || tx._height > prev._height) {
+      latestBySender.set(sender, tx);
+    }
   }
 
   console.log(`[poll] ${latestBySender.size} unique app author(s)`);
