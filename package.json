@@ -1,0 +1,14 @@
+{
+  "name": "feenix-fe-host",
+  "version": "1.0.0",
+  "description": "Frontend host for all Feenix network apps — serves at <app_name>.feenix.network",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js --dev"
+  },
+  "dependencies": {
+    "tar": "^7.4.0"
+  }
+}
