@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { loadState, saveState } from './state.js';
 import { extractFrontend } from './extractor.js';
@@ -155,8 +155,13 @@ export async function poll() {
       // Extract to target dir
       await extractFrontend(frontendBase64, targetDir);
 
-      // Release old subdomain if name changed
+      // Release old subdomain if name changed — remove stale directory too
       if (existing && existing.subdomain !== subdomain && state.subdomains[existing.subdomain] === senderAddr) {
+        const oldDir = join(APPS_DIR, existing.subdomain);
+        if (existsSync(oldDir)) {
+          rmSync(oldDir, { recursive: true, force: true });
+          console.log(`[poll] Removed stale directory for old subdomain: ${existing.subdomain}`);
+        }
         delete state.subdomains[existing.subdomain];
       }
 
