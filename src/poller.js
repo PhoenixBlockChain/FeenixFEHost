@@ -34,9 +34,19 @@ function flattenTransactions(response) {
   if (!Array.isArray(response)) return transactions;
 
   for (const item of response) {
-    if (item && Array.isArray(item.Transactions)) {
-      const height = item.Height ?? 0;
-      for (const tx of item.Transactions) {
+    const nestedTransactions = Array.isArray(item?.Transactions)
+      ? item.Transactions
+      : Array.isArray(item?.Body?.Transactions)
+        ? item.Body.Transactions
+        : null;
+
+    if (item && nestedTransactions) {
+      const txHeight = nestedTransactions.reduce(
+        (max, tx) => Math.max(max, typeof tx?.Height === 'number' ? tx.Height : 0),
+        0,
+      );
+      const height = item.Height ?? txHeight ?? 0;
+      for (const tx of nestedTransactions) {
         transactions.push({ ...tx, _height: height });
       }
     } else if (item) {
