@@ -72,6 +72,12 @@ After this step, any request to `anything.feenix.network` will:
 - Get automatic HTTPS from Cloudflare
 - Forward to your Lightsail server on port 80
 
+### Cache settings
+
+The FE host sends `no-store` cache headers for app files so updated deployments can reuse filenames without Cloudflare serving stale content.
+
+Do not add Cloudflare Cache Rules or Page Rules that force caching for `*.feenix.network/*`. If one already exists, remove it or exclude the wildcard app host from that rule.
+
 ---
 
 ## 3. Server Setup
