@@ -26,6 +26,48 @@ function sanitizeSubdomain(appName) {
 }
 
 /**
+ * New uploads can arrive under usernames like:
+ *   name_94f6922f-0402-4614-904f-244271990000
+ *   name_94f6922f-0402-4614-904f-244271990001
+ *
+ * The final 4 UUID characters identify a concrete upload account, but they are
+ * not ordered version numbers. Strip those from the identity so the newest
+ * matching account can replace what the previous account served.
+ */
+function parseUploadUsername(username) {
+  const match = String(username || '').match(
+    /^(.+_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{8})([0-9a-f]{4})$/i,
+  );
+
+  if (!match) {
+    return {
+      identity: null,
+    };
+  }
+
+  return {
+    identity: match[1].toLowerCase(),
+  };
+}
+
+function isNewerUpload(candidate, current) {
+  if (!current) return true;
+
+  const candidateHeight = Number.isFinite(candidate._height) ? candidate._height : 0;
+  const currentHeight = Number.isFinite(current._height) ? current._height : 0;
+
+  if (candidateHeight !== currentHeight) {
+    return candidateHeight > currentHeight;
+  }
+
+  if (Number.isFinite(candidate._order) && Number.isFinite(current._order)) {
+    return candidate._order < current._order;
+  }
+
+  return false;
+}
+
+/**
  * Flatten blockchain API response into a flat list of transactions.
  * Handles both block-wrapped and flat formats.
  */
@@ -33,7 +75,7 @@ function flattenTransactions(response) {
   const transactions = [];
   if (!Array.isArray(response)) return transactions;
 
-  for (const item of response) {
+  response.forEach((item, itemIndex) => {
     const nestedTransactions = Array.isArray(item?.Transactions)
       ? item.Transactions
       : Array.isArray(item?.Body?.Transactions)
@@ -47,13 +89,13 @@ function flattenTransactions(response) {
       );
       const height = item.Height ?? txHeight ?? 0;
       for (const tx of nestedTransactions) {
-        transactions.push({ ...tx, _height: height });
+        transactions.push({ ...tx, _height: height, _order: transactions.length });
       }
     } else if (item) {
       // Flat transaction / projected object
-      transactions.push({ ...item, _height: item.Height ?? 0 });
+      transactions.push({ ...item, _height: item.Height ?? 0, _order: item._order ?? itemIndex });
     }
-  }
+  });
   return transactions;
 }
 
@@ -168,19 +210,20 @@ async function isBackendRunning(username) {
  * Resolve subdomain for an app, handling collisions.
  * First-come-first-served: if the clean name is taken by another sender, suffix with short hash.
  */
-function resolveSubdomain(appName, senderAddr, state) {
+function resolveSubdomain(appName, ownerKey, state, ownerAliases = []) {
   const clean = sanitizeSubdomain(appName);
-  if (!clean) return senderAddr.slice(0, 12); // Fallback if name sanitizes to empty
+  if (!clean) return ownerKey.slice(0, 12); // Fallback if name sanitizes to empty
 
   const existing = state.subdomains[clean];
+  const allowedOwners = new Set([ownerKey, ...ownerAliases].filter(Boolean));
 
   // Clean name available or already owned by this sender
-  if (!existing || existing === senderAddr) {
+  if (!existing || allowedOwners.has(existing)) {
     return clean;
   }
 
   // Collision — append short sender hash
-  const suffix = senderAddr.slice(0, 8).toLowerCase();
+  const suffix = ownerKey.slice(0, 8).toLowerCase();
   return sanitizeSubdomain(`${clean}-${suffix}`);
 }
 
@@ -199,7 +242,7 @@ export async function poll() {
   const allTxs = await fetchMetadata();
   console.log(`[poll] Found ${allTxs.length} total APP_BE transaction(s)`);
 
-  // Keep the newest tx per sender (highest block height wins)
+  // Keep the newest tx per sender first, then collapse versioned upload usernames.
   const latestBySender = new Map();
   for (const tx of allTxs) {
     const sender = tx.senderAddr || tx.sender_addr;
@@ -212,13 +255,45 @@ export async function poll() {
 
   console.log(`[poll] ${latestBySender.size} unique app author(s)`);
 
+  const latestByUpload = new Map();
+  for (const [senderAddr, tx] of latestBySender) {
+    const username = await getUsername(senderAddr);
+    if (!username) {
+      console.warn(`[poll] Could not resolve username for "${tx.app_name || 'unnamed'}" — skipping`);
+      continue;
+    }
+
+    const upload = parseUploadUsername(username);
+    const appKey = upload.identity || senderAddr;
+    const candidate = {
+      ...tx,
+      senderAddr,
+      username,
+      appKey,
+    };
+
+    if (isNewerUpload(candidate, latestByUpload.get(appKey))) {
+      latestByUpload.set(appKey, candidate);
+    }
+  }
+
+  console.log(`[poll] ${latestByUpload.size} app upload group(s) after username versioning`);
+
   let newCount = 0;
   let updateCount = 0;
 
-  for (const [senderAddr, tx] of latestBySender) {
+  for (const [appKey, tx] of latestByUpload) {
+    const senderAddr = tx.senderAddr;
     const txHash = tx.tx_hash;
     const appName = tx.app_name || 'unnamed';
-    const existing = state.apps[senderAddr];
+    const cleanSubdomain = sanitizeSubdomain(appName);
+    const subdomainOwner = state.subdomains[cleanSubdomain];
+    const existingBySubdomain = subdomainOwner ? state.apps[subdomainOwner] : null;
+    const existing =
+      state.apps[appKey] ||
+      state.apps[senderAddr] ||
+      (existingBySubdomain?.appName === appName ? existingBySubdomain : null);
+    const ownerAliases = [senderAddr, existing?.senderAddr, subdomainOwner];
 
     // Skip if already deployed at this version
     if (existing && existing.txHash === txHash && existing.deployed) continue;
@@ -228,7 +303,7 @@ export async function poll() {
     // "update" = deployed at an older txHash — needs delist
     const isUpdate = existing && existing.deployed && existing.txHash !== txHash;
 
-    const subdomain = resolveSubdomain(appName, senderAddr, state);
+    const subdomain = resolveSubdomain(appName, appKey, state, ownerAliases);
     const targetDir = join(APPS_DIR, subdomain);
 
     try {
@@ -239,10 +314,16 @@ export async function poll() {
         if (existsSync(oldDir)) {
           rmSync(oldDir, { recursive: true, force: true });
         }
-        if (state.subdomains[oldSubdomain] === senderAddr) {
+        if (
+          state.subdomains[oldSubdomain] === appKey ||
+          state.subdomains[oldSubdomain] === senderAddr ||
+          state.subdomains[oldSubdomain] === subdomainOwner
+        ) {
           delete state.subdomains[oldSubdomain];
         }
+        delete state.apps[appKey];
         delete state.apps[senderAddr];
+        if (subdomainOwner) delete state.apps[subdomainOwner];
         saveState(STATE_FILE, state);
         console.log(`[poll] Delisted "${appName}" at ${oldSubdomain}.feenix.network — waiting for backend`);
       }
@@ -252,7 +333,7 @@ export async function poll() {
       }
 
       // Verify backend is running before hosting frontend
-      const username = await getUsername(senderAddr);
+      const username = tx.username;
       if (!username) {
         console.warn(`[poll] Could not resolve username for "${appName}" — skipping`);
         continue;
@@ -263,10 +344,12 @@ export async function poll() {
         // Save as pending so we don't re-log "New app" every cycle
         if (!isPending) {
           console.log(`[poll] No running backend for "${appName}" (author: ${username}) — waiting`);
-          state.apps[senderAddr] = {
+          state.apps[appKey] = {
             txHash,
             appName,
             subdomain,
+            senderAddr,
+            username,
             deployed: false,
             lastUpdated: new Date().toISOString(),
           };
@@ -290,14 +373,16 @@ export async function poll() {
       await extractFrontend(frontendBase64, targetDir);
 
       // Update state — mark as deployed
-      state.apps[senderAddr] = {
+      state.apps[appKey] = {
         txHash,
         appName,
         subdomain,
+        senderAddr,
+        username,
         deployed: true,
         lastUpdated: new Date().toISOString(),
       };
-      state.subdomains[subdomain] = senderAddr;
+      state.subdomains[subdomain] = appKey;
       saveState(STATE_FILE, state);
 
       if (isUpdate || isPending) updateCount++;
