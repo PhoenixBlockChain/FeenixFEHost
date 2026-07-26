@@ -100,40 +100,90 @@ function flattenTransactions(response) {
 }
 
 /**
+ * GET /api/v1/get is paginated: it returns at most ~200 blocks / 5 MB per call,
+ * then hands back a cursor in response headers:
+ *   X-Feenix-Next-Hash — the lastBlockHash to send on the next call
+ *   X-Feenix-Has-More  — "true" while more pages remain
+ *
+ * `query` is required — a request without one is rejected with a 400.
+ *
+ * Yields one page (array of blocks, newest first) at a time so callers can
+ * either accumulate everything or bail out early once they've found a match.
+ */
+const PAGE_CAP = 1000; // Safety net against a cursor that never terminates
+
+async function* fetchPages(query, timeoutMs) {
+  let cursor = '0';
+
+  for (let page = 0; page < PAGE_CAP; page++) {
+    const url = `${BLOCKCHAIN_API}/api/v1/get?lastBlockHash=${encodeURIComponent(cursor)}&query=${encodeURIComponent(query)}`;
+
+    const res = await fetch(url, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+
+    const body = await res.json();
+    yield Array.isArray(body) ? body : [];
+
+    // An empty page does NOT mean we're done — a page can match nothing and
+    // still be followed by pages that match. Only the header ends the loop.
+    if (res.headers.get('X-Feenix-Has-More') !== 'true') return;
+
+    const next = res.headers.get('X-Feenix-Next-Hash');
+    if (!next || next === cursor) {
+      console.warn(`[poll] has-more=true but cursor did not advance (${cursor}) — stopping early`);
+      return;
+    }
+    cursor = next;
+  }
+
+  console.warn(`[poll] Hit ${PAGE_CAP}-page cap — results may be incomplete`);
+}
+
+/**
  * Phase 1: Fetch metadata for all APP_BE transactions.
  * Uses JMESPath projection to avoid downloading huge codebase blobs.
+ * Walks every page so we see the full app set, not just the newest ~200 blocks.
  */
 async function fetchMetadata() {
   const query = `[?Body.Data.type=='APP_BE'].{tx_hash: Hash, senderAddr: Body."Sender Address", app_name: Body.Data.app_name, app_description: Body.Data.app_description}`;
-  const url = `${BLOCKCHAIN_API}/api/v1/get?lastBlockHash=0&query=${encodeURIComponent(query)}`;
 
-  const res = await fetch(url, {
-    headers: { accept: 'application/json' },
-    signal: AbortSignal.timeout(60_000),
-  });
+  const blocks = [];
+  let pages = 0;
+  try {
+    for await (const page of fetchPages(query, 60_000)) {
+      blocks.push(...page);
+      pages++;
+    }
+  } catch (err) {
+    throw new Error(`Metadata fetch failed: ${err.message}`);
+  }
 
-  if (!res.ok) throw new Error(`Metadata fetch failed: ${res.status} ${res.statusText}`);
-  const data = await res.json();
-  return flattenTransactions(data);
+  console.log(`[poll] Fetched ${blocks.length} matching block(s) across ${pages} page(s)`);
+  // Flatten once over the concatenated pages so _order stays globally ordered.
+  return flattenTransactions(blocks);
 }
 
 /**
  * Phase 2: Fetch frontend_codebase for a specific transaction hash.
+ * At most one block matches, so stop paging as soon as it turns up.
  */
 async function fetchFrontendCodebase(txHash) {
   const query = `[?Hash=='${txHash}'].{frontend_codebase: Body.Data.frontend_codebase}`;
-  const url = `${BLOCKCHAIN_API}/api/v1/get?lastBlockHash=0&query=${encodeURIComponent(query)}`;
 
-  const res = await fetch(url, {
-    headers: { accept: 'application/json' },
-    signal: AbortSignal.timeout(120_000),
-  });
+  try {
+    for await (const page of fetchPages(query, 120_000)) {
+      const txs = flattenTransactions(page);
+      if (txs.length > 0) return txs[0].frontend_codebase || null;
+    }
+  } catch (err) {
+    throw new Error(`Frontend fetch failed for ${txHash}: ${err.message}`);
+  }
 
-  if (!res.ok) throw new Error(`Frontend fetch failed for ${txHash}: ${res.status}`);
-  const data = await res.json();
-  const txs = flattenTransactions(data);
-  if (txs.length === 0) return null;
-  return txs[0].frontend_codebase || null;
+  return null;
 }
 
 /**

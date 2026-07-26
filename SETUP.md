@@ -252,8 +252,9 @@ sudo usermod -aG docker $USER
 ### Poller can't reach the blockchain API
 
 ```bash
-# Test from the server
-curl -s http://api.feenix.network/api/v1/get?lastBlockHash=0 | head -c 200
+# Test from the server. `query` is required — a request without one returns 400.
+# -i shows the paging headers (X-Feenix-Next-Hash / X-Feenix-Has-More).
+curl -si "http://api.feenix.network/api/v1/get?lastBlockHash=0&query=%5B%3FBody.Data.type%3D%3D'APP_BE'%5D.%7Btx_hash%3A%20Hash%7D" | head -c 400
 ```
 
 If this times out, your Lightsail outbound networking may be blocked (unlikely but check security groups).
