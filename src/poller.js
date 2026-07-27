@@ -30,9 +30,14 @@ function sanitizeSubdomain(appName) {
  *   name_94f6922f-0402-4614-904f-244271990000
  *   name_94f6922f-0402-4614-904f-244271990001
  *
- * The final 4 UUID characters identify a concrete upload account, but they are
- * not ordered version numbers. Strip those from the identity so the newest
- * matching account can replace what the previous account served.
+ * The final 4 UUID characters identify a concrete upload account. Strip those
+ * from the identity so the newest matching account can replace what the previous
+ * account served.
+ *
+ * Do NOT rank versions by that 4-character suffix. It is not a reliable ordering
+ * key: some accounts carry a plain counter (0001, 0002, …) while others end in a
+ * random UUID tail (28be, 7a32), and the two mix within one identity. Which
+ * upload is newest is decided by position on the chain — see fetchMetadata.
  */
 function parseUploadUsername(username) {
   const match = String(username || '').match(
@@ -147,23 +152,34 @@ async function* fetchPages(query, timeoutMs) {
  * Phase 1: Fetch metadata for all APP_BE transactions.
  * Uses JMESPath projection to avoid downloading huge codebase blobs.
  * Walks every page so we see the full app set, not just the newest ~200 blocks.
+ *
+ * ORDERING (important — this is what decides which upload gets hosted):
+ * Blocks carry no height or timestamp, so position in the stream is the only
+ * recency signal we have. Paging returns pages OLDEST-PAGE-FIRST, but the blocks
+ * *within* each page are newest-first. So chain-newest-first means reversing the
+ * page order while leaving each page's contents alone.
+ *
+ * Concatenating pages as they arrive puts the OLDEST upload first, which makes
+ * the poller host a stale frontend (e.g. shaker ...0004 instead of the current
+ * upload). Do not "simplify" this reverse away.
  */
 async function fetchMetadata() {
   const query = `[?Body.Data.type=='APP_BE'].{tx_hash: Hash, senderAddr: Body."Sender Address", app_name: Body.Data.app_name, app_description: Body.Data.app_description}`;
 
-  const blocks = [];
-  let pages = 0;
+  const pages = [];
   try {
     for await (const page of fetchPages(query, 60_000)) {
-      blocks.push(...page);
-      pages++;
+      pages.push(page);
     }
   } catch (err) {
     throw new Error(`Metadata fetch failed: ${err.message}`);
   }
 
-  console.log(`[poll] Fetched ${blocks.length} matching block(s) across ${pages} page(s)`);
-  // Flatten once over the concatenated pages so _order stays globally ordered.
+  // Newest page first; within a page the API already gives us newest first.
+  const blocks = pages.reverse().flat();
+
+  console.log(`[poll] Fetched ${blocks.length} matching block(s) across ${pages.length} page(s)`);
+  // Flatten once over the ordered pages so _order runs newest → oldest.
   return flattenTransactions(blocks);
 }
 
